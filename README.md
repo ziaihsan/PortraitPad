@@ -27,8 +27,13 @@ Tidak ada salinan piksel lewat CPU. Saat diam sekitar 0,5–0,7% CPU dan ~15–3
 | Ketuk 2× / 3× cepat | Double / triple click |
 | 1 jari geser (langsung atau setelah ditahan) | Scroll mengikuti jari, dengan momentum |
 | 2 jari geser atas/bawah | Scroll |
-| 2 jari geser ke kiri / kanan | Pindah Space / aplikasi full-screen (Ctrl+→ / Ctrl+←) di layar iPad; pointer dan fokus keyboard tetap di tempatnya |
+| 2 jari geser ke kiri / kanan | Pindah Space / aplikasi full-screen (Ctrl+→ / Ctrl+←) di layar iPad, dikirim setelah jari diangkat |
 | 3 jari atau lebih | Diabaikan |
+
+Saat scroll dan swipe, pointer tidak terlihat bergerak. macOS mengirim scroll ke jendela di bawah
+pointer dan memindah Space di layar tempat pointer berada, jadi pointer dipindah sementara dalam
+keadaan tersembunyi, lalu dikembalikan ke posisi semula. Fokus keyboard juga dikembalikan kalau
+pointer tadinya di layar lain.
 
 Sidecar mengirim sentuhan jari ke *gesture recognizer* AppKit (event `directTouch`), bukan sebagai
 event mouse. Lihat komentar di `InputView` (`Sources/main.swift`) untuk detailnya.
@@ -106,5 +111,6 @@ build/eventprobe --cursortest > probe.log    # juga: --passive, --level=N
 ## Batasan
 
 - Sidecar dikunci Apple di **60 Hz**. Layar ProMotion 120 Hz tidak bisa dipakai lewat jalur ini.
-- `CGVirtualDisplay` adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih ada di macOS 27).
+- `CGVirtualDisplay` dan properti `SetsCursorInBackground` (untuk menyembunyikan pointer dari latar
+  belakang) adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih jalan di macOS 27).
 - Desktop Sidecar asli tetap ada di belakang stream. Jendela yang terseret ke sana tidak terlihat.

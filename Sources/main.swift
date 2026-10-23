@@ -28,6 +28,12 @@ let logFile: FileHandle? = {
 let debugInput = UserDefaults.standard.bool(forKey: "debugInput")
 let debugEvents = UserDefaults.standard.bool(forKey: "debugEvents")
 
+// A background app normally can't hide the pointer; this connection property (private SkyLight API,
+// verified on macOS 27) lets PortraitPad hide it while a touch borrows it.
+@_silgen_name("_CGSDefaultConnection") func _CGSDefaultConnection() -> Int32
+@_silgen_name("CGSSetConnectionProperty")
+func CGSSetConnectionProperty(_ cid: Int32, _ target: Int32, _ key: CFString, _ value: CFTypeRef) -> Int32
+
 func log(_ s: String) {
     let line = String(format: "%.3f ", ProcessInfo.processInfo.systemUptime) + "[PortraitPad] \(s)\n"
     FileHandle.standardError.write(line.data(using: .utf8)!)
@@ -46,10 +52,12 @@ func sidecarScreen() -> NSScreen? {
 // display. Needs Accessibility permission to post events.
 //
 // Sidecar hands finger touches to AppKit gesture recognizers (as direct-touch events) rather than as
-// mouse events. A zero-delay press recognizer tracks one-finger touches: a short still touch clicks, a
-// drag scrolls the content under the finger (with momentum on release). It cancels when a second finger
-// lands and never restarts, so a two-finger pan recognizer takes over: sideways switches Spaces /
-// full-screen apps like the trackpad does, up and down scrolls.
+// mouse events. Three recognizers share each touch:
+//   - a zero-delay press: only for taps (a short still touch clicks);
+//   - a pan: every drag. One finger scrolls the content under it (momentum on release); two fingers
+//     sideways switch Spaces / full-screen apps like the trackpad does, up and down scroll;
+//   - a two-finger pan: takes over when the plain pan gives up on a second finger.
+// Fingers rarely land together; when a second one lands early in a scroll, the drag is re-judged.
 final class InputView: NSView, NSGestureRecognizerDelegate {
     var toPortrait: ((NSPoint) -> CGPoint?)?
 
@@ -59,31 +67,37 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
     static let momentumDecay: CGFloat = 0.965   // per frame at 60 Hz
     static let momentumMinSpeed: CGFloat = 150  // pt/s to start a fling; it stops below 20 pt/s
     static let spaceSwipeDistance: CGFloat = 60 // pt sideways for a two-finger swipe to switch Spaces
+    static let rejudgeScroll: CGFloat = 80      // a scroll this short still turns into a swipe on a 2nd finger
+    static let pointerParkTime = 0.15           // s the pointer stays on the iPad for a Space switch
     static let stallTimeout = 4.0               // s without updates mid-touch before tracking is reset
 
     private enum Mode { case undecided, scroll, spaceSwipe, ignored }
 
     private let source = CGEventSource(stateID: .hidSystemState)
-    private var touchStart = NSPoint.zero, touchStartTime = Date(), lastPoint = NSPoint.zero
-    private var mode = Mode.undecided, verticalLock = true, fingers = 1
+    private var touchStart = NSPoint.zero, lastPoint = NSPoint.zero
+    private var mode = Mode.undecided, verticalLock = true, fingers = 1, scrolled: CGFloat = 0
     private var remainder = CGVector.zero                       // sub-point scroll left to post
     private var samples: [(t: TimeInterval, d: CGVector)] = []  // recent scroll deltas, for fling speed
     private var momentum: Timer?
     private var lastTap: (time: Date, at: NSPoint, count: Int64)?
+    private var press: (start: NSPoint, time: Date, dragged: Bool)?
+    private var lastSpaceSwitch = Date.distantPast
     private var watchdog: DispatchWorkItem?
-    private weak var active: NSGestureRecognizer?               // the recognizer that owns the current touch
+    private weak var active: NSGestureRecognizer?               // the drag recognizer that owns the touch
+    private var cursorHome: CGPoint?                            // pointer position while a touch borrows it
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        let touch = NSPressGestureRecognizer(target: self, action: #selector(trackOneFinger(_:)))
-        touch.minimumPressDuration = 0
-        touch.allowableMovement = .greatestFiniteMagnitude
-        touch.delegate = self
-        addGestureRecognizer(touch)
-        let twoFingers = NSPanGestureRecognizer(target: self, action: #selector(trackTwoFingers(_:)))
-        twoFingers.numberOfTouchesRequired = 2
-        twoFingers.delegate = self
-        addGestureRecognizer(twoFingers)
+        let tap = NSPressGestureRecognizer(target: self, action: #selector(trackTap(_:)))
+        tap.minimumPressDuration = 0
+        tap.allowableMovement = .greatestFiniteMagnitude
+        let drag = NSPanGestureRecognizer(target: self, action: #selector(trackDrag(_:)))
+        let twoFingerDrag = NSPanGestureRecognizer(target: self, action: #selector(trackDrag(_:)))
+        twoFingerDrag.numberOfTouchesRequired = 2
+        for g in [tap, drag, twoFingerDrag] {
+            g.delegate = self
+            addGestureRecognizer(g)
+        }
     }
 
     func gestureRecognizer(_ g: NSGestureRecognizer, shouldRecognizeSimultaneouslyWith other: NSGestureRecognizer) -> Bool {
@@ -96,33 +110,66 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
 
     // MARK: touch tracking
 
-    @objc private func trackOneFinger(_ g: NSPressGestureRecognizer) { track(g, fingers: 1) }
-    @objc private func trackTwoFingers(_ g: NSPanGestureRecognizer) { track(g, fingers: 2) }
-
-    private func track(_ g: NSGestureRecognizer, fingers n: Int) {
+    @objc private func trackTap(_ g: NSPressGestureRecognizer) {
         let p = g.location(in: self)
-        if debugInput { log("touch[\(n)] state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent()) }
-        if g.state != .began, g !== active { return }   // updates from a touch that was handed over
+        if debugInput { log("tap state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent()) }
+        switch g.state {
+        case .began:
+            stopMomentum()
+            press = (p, Date(), false)
+        case .ended:
+            guard let t = press, !t.dragged, touchCount() == 1, Date().timeIntervalSince(t.time) <= Self.tapMaxDuration,
+                  hypot(p.x - t.start.x, p.y - t.start.y) <= Self.tapSlop else { break }
+            click(at: t.start)
+        default:
+            break
+        }
+        if g.state == .ended || g.state == .cancelled { press = nil }
+    }
+
+    @objc private func trackDrag(_ g: NSPanGestureRecognizer) {
+        let p = g.location(in: self)
+        if debugInput {
+            log("drag[\(g.numberOfTouchesRequired)] state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent())
+        }
+        if g.state == .began {
+            guard active == nil else { return }             // the other drag recognizer already has it
+            active = g
+        } else if g !== active {
+            return
+        }
         armWatchdog(g)
         switch g.state {
         case .began:
-            if active != nil, active !== g { abandonTouch() }   // a second finger landed: two-finger takes over
-            active = g
             stopMomentum()
-            fingers = max(n, touchCount())
+            press?.dragged = true
+            let t = g.translation(in: self)
+            touchStart = NSPoint(x: p.x - t.x, y: p.y - t.y)  // where the finger landed
+            lastPoint = touchStart
+            fingers = max(g.numberOfTouchesRequired, touchCount())
             mode = .undecided
-            touchStart = p
-            lastPoint = p
-            touchStartTime = Date()
             remainder = .zero
             samples = []
+            scrolled = 0
+            fallthrough
         case .changed:
-            fingers = max(fingers, touchCount())
+            let n = touchCount()
+            if n > fingers {
+                fingers = n
+                // A second finger landing early in a scroll: the scroll was really the start of a swipe.
+                if mode == .scroll, scrolled < Self.rejudgeScroll {
+                    postScroll(.zero, phase: 4)
+                    mode = .undecided
+                    touchStart = p
+                    lastPoint = p
+                }
+            }
             if mode == .undecided, hypot(p.x - touchStart.x, p.y - touchStart.y) > Self.tapSlop { decideMode(at: p) }
             if mode == .scroll {
                 let d = contentDelta(from: lastPoint, to: p)
                 postScroll(d, phase: 2)             // changed
                 samples.append((ProcessInfo.processInfo.systemUptime, d))
+                scrolled += abs(d.dx) + abs(d.dy)
             }
             lastPoint = p
         case .ended, .cancelled:
@@ -131,13 +178,10 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
             case .scroll:
                 postScroll(.zero, phase: 4)         // ended
                 startMomentum(flingVelocity())
+                if momentum == nil { returnCursor() }
             case .spaceSwipe:
                 finishSpaceSwipe()
-            case .undecided:
-                if g.state == .ended, fingers == 1, Date().timeIntervalSince(touchStartTime) <= Self.tapMaxDuration {
-                    click(at: touchStart)
-                }
-            case .ignored:
+            case .undecided, .ignored:
                 break
             }
             mode = .undecided
@@ -146,13 +190,7 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
         }
     }
 
-    private func abandonTouch() {
-        if mode == .scroll { postScroll(.zero, phase: 4) }
-        mode = .undecided
-        active = nil
-    }
-
-    // Once a touch has moved: two fingers sideways switch Spaces, three or more do nothing, anything else scrolls.
+    // Once a drag has moved: two fingers sideways switch Spaces, three or more do nothing, anything else scrolls.
     private func decideMode(at p: NSPoint) {
         let d = contentDelta(from: touchStart, to: p)
         defer { if debugInput { log("decide fingers=\(fingers) sideways=\(Int(d.dx)) vertical=\(Int(d.dy)) -> \(mode)") } }
@@ -163,7 +201,8 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
         } else {
             mode = .scroll
             verticalLock = abs(d.dy) >= abs(d.dx)
-            moveCursor(to: touchStart)              // scroll events go to the window under the pointer
+            borrowCursor()                          // scroll events go to the window under the pointer,
+            moveCursor(to: touchStart)              // so it moves there, hidden, and comes back afterwards
             postScroll(.zero, phase: 1)             // began
             lastPoint = touchStart                  // the slop distance scrolls too, so nothing jumps
         }
@@ -190,22 +229,27 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
         let d = contentDelta(from: touchStart, to: lastPoint)
         if debugInput { log("space swipe sideways=\(Int(d.dx)) vertical=\(Int(d.dy))") }
         guard abs(d.dx) > Self.spaceSwipeDistance, abs(d.dx) > abs(d.dy) * 1.5,
+              Date().timeIntervalSince(lastSpaceSwitch) > 0.4,   // one switch per swipe, even if handed over
               let target = toPortrait?(touchStart), let ipad = portraitBounds(),
               let home = CGEvent(source: nil)?.location else { return }
+        lastSpaceSwitch = Date()
         let previous = NSWorkspace.shared.frontmostApplication
-        // Space switching acts on the display under the pointer: park it on the iPad just long enough for
-        // the Dock to read it (30 ms was enough in testing; 0 was not), then put it back where it was.
-        CGWarpMouseCursorPosition(target)
-        pressControlArrow(d.dx < 0 ? 124 : 123)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            CGWarpMouseCursorPosition(home)
-            CGAssociateMouseAndMouseCursorPosition(1)   // no brief pointer freeze after the warp
+        let key: CGKeyCode = d.dx < 0 ? 124 : 123
+        if ipad.contains(home) {
+            pressControlArrow(key)
+        } else {
+            // Space switching acts on the display under the pointer: park it on the iPad until the Dock has
+            // read it, then put it back. 30 ms worked in a quiet test but 50 ms sometimes missed.
+            borrowCursor()
+            CGWarpMouseCursorPosition(target)
+            pressControlArrow(key)
+            returnCursor(after: Self.pointerParkTime)
+            // The new Space activates its own app; keep the keyboard where you were working.
+            if let previous {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.restoreFocus(previous, ipad: ipad) }
+            }
         }
-        // The new Space activates its own app. When the pointer was on another screen, keep the keyboard
-        // where it was once the switch animation is done.
-        if !ipad.contains(home), let previous {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.restoreFocus(previous, ipad: ipad) }
-        }
+        if debugInput { log("space switch key=\(key) pointerParked=\(!ipad.contains(home))") }
     }
 
     private func portraitBounds() -> CGRect? {
@@ -250,18 +294,31 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
     // MARK: posting
 
     // Arrow keys carry the fn and numeric-pad flags on a real keyboard; the Mission Control hotkeys match on them.
+    // Pressed like a real keyboard: Control down, arrow down/up, Control up. Only flagging the arrow left
+    // Control "held" in the event source, so every later tap became a Control-click (a right-click).
     private func pressControlArrow(_ keyCode: CGKeyCode) {
-        for down in [true, false] {
-            guard let e = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: down) else { continue }
-            e.flags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+        let control: CGKeyCode = 59
+        let arrowFlags: CGEventFlags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+        for (key, down, flags) in [(control, true, CGEventFlags.maskControl), (keyCode, true, arrowFlags),
+                                   (keyCode, false, arrowFlags), (control, false, [])] {
+            guard let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else { continue }
+            e.flags = flags
             e.post(tap: .cghidEventTap)
         }
     }
 
+    // Modifier keys really held on the keyboard (so Cmd-tap still works), never leftovers from posted keys.
+    private func heldModifiers() -> CGEventFlags {
+        CGEventSource.flagsState(.combinedSessionState)
+            .intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
+    }
+
     private func moveCursor(to viewPoint: NSPoint) {
         guard let p = toPortrait?(viewPoint) else { return }
-        CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)?
-            .post(tap: .cghidEventTap)
+        guard let e = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)
+        else { return }
+        e.flags = heldModifiers()
+        e.post(tap: .cghidEventTap)
     }
 
     private func click(at viewPoint: NSPoint) {
@@ -277,6 +334,7 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
             guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: .left)
             else { continue }
             if type != .mouseMoved { e.setIntegerValueField(.mouseEventClickState, value: count) }
+            e.flags = heldModifiers()
             e.post(tap: .cghidEventTap)
         }
     }
@@ -292,6 +350,7 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
         guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: v, wheel2: h, wheel3: 0)
         else { return }
         e.location = anchor
+        e.flags = heldModifiers()
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
         e.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
@@ -329,6 +388,29 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
         timer.invalidate()
         momentum = nil
         postScroll(.zero, phase: 0, momentum: 3)
+        returnCursor()
+    }
+
+    // MARK: pointer borrowing
+
+    // Hides the pointer and remembers where it was; a touch can then move it (scroll routing, Space
+    // switching) without it visibly jumping or flickering.
+    private func borrowCursor() {
+        guard cursorHome == nil, let home = CGEvent(source: nil)?.location else { return }
+        cursorHome = home
+        CGDisplayHideCursor(CGMainDisplayID())
+    }
+
+    // Puts the pointer back and shows it, a moment later so already-posted scroll events still reach
+    // the window they were meant for.
+    private func returnCursor(after delay: TimeInterval = 0.05) {
+        guard let home = cursorHome else { return }
+        cursorHome = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            CGWarpMouseCursorPosition(home)
+            CGAssociateMouseAndMouseCursorPosition(1)   // no brief pointer freeze after the warp
+            CGDisplayShowCursor(CGMainDisplayID())
+        }
     }
 
     // MARK: trackpad/mouse that wanders onto the Sidecar screen
@@ -610,6 +692,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Quit PortraitPad", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
         statusItem = item
+
+        let cid = _CGSDefaultConnection()
+        _ = CGSSetConnectionProperty(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 
         // Touch forwarding posts events, which macOS only allows with Accessibility permission.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
