@@ -26,6 +26,12 @@ let logFile: FileHandle? = {
 // `defaults write local.z.PortraitPad debugInput -bool true` logs each touch update (for gesture work).
 let debugInput = UserDefaults.standard.bool(forKey: "debugInput")
 
+// A background app normally can't hide the pointer; this connection property (private SkyLight API,
+// verified on macOS 27) lets PortraitPad hide it while a scroll borrows it.
+@_silgen_name("_CGSDefaultConnection") func _CGSDefaultConnection() -> Int32
+@_silgen_name("CGSSetConnectionProperty")
+func CGSSetConnectionProperty(_ cid: Int32, _ target: Int32, _ key: CFString, _ value: CFTypeRef) -> Int32
+
 func log(_ s: String) {
     let line = String(format: "%.3f ", ProcessInfo.processInfo.systemUptime) + "[PortraitPad] \(s)\n"
     FileHandle.standardError.write(line.data(using: .utf8)!)
@@ -62,6 +68,8 @@ final class InputView: NSView {
     private var remainder = CGVector.zero                       // sub-point scroll left to post
     private var samples: [(t: TimeInterval, d: CGVector)] = []  // recent scroll deltas, for fling speed
     private var momentum: Timer?
+    private var lent: (home: CGPoint, spot: CGPoint, since: Date)?   // pointer lent to a scroll (see lendCursor)
+    private var lentWatch: Timer?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -82,7 +90,7 @@ final class InputView: NSView {
         if debugInput { log("touch state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent()) }
         switch g.state {
         case .began:
-            stopMomentum()
+            stopMomentum(returnAfter: 0)
             ignoring = !isOneFinger()
             touchStart = p
             lastPoint = p
@@ -101,7 +109,7 @@ final class InputView: NSView {
                 scrolling = true
                 let d = contentDelta(from: touchStart, to: p)
                 verticalLock = abs(d.dy) >= abs(d.dx)
-                pointCursor(at: touchStart)         // scroll events go to the window under the pointer
+                lendCursor(to: touchStart)          // scroll events go to the window under the pointer
                 postScroll(.zero, phase: 1)         // began
                 lastPoint = touchStart              // the slop distance scrolls too, so nothing jumps
             }
@@ -138,6 +146,7 @@ final class InputView: NSView {
         scrolling = false
         postScroll(.zero, phase: 4)                 // ended
         if fling { startMomentum(flingVelocity()) }
+        if momentum == nil { giveCursorBack(after: 0.05) }
     }
 
     // Finger movement in this (landscape, y-up) view -> content movement on the portrait display.
@@ -157,15 +166,57 @@ final class InputView: NSView {
             .intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
     }
 
-    // Moves the pointer under the finger only when it isn't already over the window being touched,
-    // so scrolling on the iPad usually leaves the pointer where it is.
-    private func pointCursor(at viewPoint: NSPoint) {
-        guard let p = toPortrait?(viewPoint), let here = CGEvent(source: nil)?.location else { return }
-        if let target = windowNumber(at: p), target == windowNumber(at: here) { return }
-        guard let e = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)
-        else { return }
-        e.flags = heldModifiers()
-        e.post(tap: .cghidEventTap)
+    // MARK: lending the pointer to a scroll
+
+    // macOS sends scroll events to the window under the pointer, and apps like Claude (Electron) ignore
+    // scrolls posted to them directly. So when the pointer isn't already over the touched window, it is
+    // lent to the scroll: hidden, put under the finger, and given back when the scroll and its momentum
+    // end. On screen it never leaves where you had it. Moving the trackpad or mouse meanwhile takes it back
+    // at once (the scroll stops), so it is never dragged away from you; after 6 s it is returned regardless.
+    private func lendCursor(to viewPoint: NSPoint) {
+        guard lent == nil, let spot = toPortrait?(viewPoint), let home = CGEvent(source: nil)?.location else { return }
+        if let target = windowNumber(at: spot), target == windowNumber(at: home) { return }
+        lent = (home, spot, Date())
+        CGDisplayHideCursor(CGMainDisplayID())
+        CGWarpMouseCursorPosition(spot)
+        CGAssociateMouseAndMouseCursorPosition(1)
+        let watch = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.watchLentCursor() }
+        RunLoop.main.add(watch, forMode: .common)
+        lentWatch = watch
+    }
+
+    private func watchLentCursor() {
+        guard let l = lent, let now = CGEvent(source: nil)?.location else { return }
+        let moved = hypot(now.x - l.spot.x, now.y - l.spot.y) > 2
+        guard moved || Date().timeIntervalSince(l.since) > 6 else { return }
+        if moved { log("pointer moved during a scroll; giving it back") }
+        if scrolling {                              // stop scrolling: it would now hit whatever is under the pointer
+            postScroll(.zero, phase: 4)
+            scrolling = false
+            ignoring = true
+        }
+        stopMomentum(returnAfter: 0)
+        giveCursorBack()
+    }
+
+    // Puts the lent pointer back where it was and shows it. A short delay lets already-posted scroll
+    // events reach the window they were meant for.
+    private func giveCursorBack(after delay: TimeInterval = 0) {
+        guard let l = lent else { return }
+        lent = nil
+        lentWatch?.invalidate()
+        lentWatch = nil
+        let restore = {
+            CGWarpMouseCursorPosition(l.home)
+            CGAssociateMouseAndMouseCursorPosition(1)   // no brief pointer freeze after the warp
+            CGDisplayShowCursor(CGMainDisplayID())
+        }
+        if delay > 0 { DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: restore) } else { restore() }
+    }
+
+    func releaseCursor() {
+        stopMomentum(returnAfter: 0)
+        giveCursorBack()
     }
 
     private func windowNumber(at p: CGPoint) -> Int? {
@@ -234,11 +285,14 @@ final class InputView: NSView {
         momentum = timer
     }
 
-    private func stopMomentum() {
-        guard let timer = momentum else { return }
-        timer.invalidate()
-        momentum = nil
-        postScroll(.zero, phase: 0, momentum: 3)
+    // The momentum's end event is posted while the lent pointer is still in place, then it goes back.
+    private func stopMomentum(returnAfter delay: TimeInterval = 0.05) {
+        if let timer = momentum {
+            timer.invalidate()
+            momentum = nil
+            postScroll(.zero, phase: 0, momentum: 3)
+        }
+        giveCursorBack(after: delay)
     }
 }
 
@@ -284,6 +338,7 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         log("stopping")
+        (window?.contentView as? InputView)?.releaseCursor()
         stream?.stopCapture { _ in }
         stream = nil
         window?.orderOut(nil)
@@ -523,6 +578,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
 
         UserDefaults.standard.removeObject(forKey: "sidecarOrigin")   // older versions saved it; now always parked
+        let cid = _CGSDefaultConnection()
+        _ = CGSSetConnectionProperty(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 
         // Touch forwarding posts events, which macOS only allows with Accessibility permission.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
