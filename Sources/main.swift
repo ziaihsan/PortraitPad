@@ -13,7 +13,7 @@ let pointsW = 984, pointsH = 1312          // portrait size in points (3:4, matc
 let pixelsW = pointsW * 2, pixelsH = pointsH * 2
 let fps: Int32 = 60                         // Sidecar's ceiling
 let rotation = CGFloat.pi / 2               // +90° (CCW): top of portrait image -> left edge of Sidecar
-let vdOriginKey = "portraitOrigin", sidecarOriginKey = "sidecarOrigin"
+let vdOriginKey = "portraitOrigin"
 
 let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/PortraitPad.log")
 let logFile: FileHandle? = {
@@ -23,16 +23,8 @@ let logFile: FileHandle? = {
     return h
 }()
 
-// Gesture debugging: `defaults write local.z.PortraitPad debugInput -bool true` logs each touch update and
-// the gesture decisions; `debugEvents` additionally logs every system input event (heavy: it lags).
+// `defaults write local.z.PortraitPad debugInput -bool true` logs each touch update (for gesture work).
 let debugInput = UserDefaults.standard.bool(forKey: "debugInput")
-let debugEvents = UserDefaults.standard.bool(forKey: "debugEvents")
-
-// A background app normally can't hide the pointer; this connection property (private SkyLight API,
-// verified on macOS 27) lets PortraitPad hide it while a touch borrows it.
-@_silgen_name("_CGSDefaultConnection") func _CGSDefaultConnection() -> Int32
-@_silgen_name("CGSSetConnectionProperty")
-func CGSSetConnectionProperty(_ cid: Int32, _ target: Int32, _ key: CFString, _ value: CFTypeRef) -> Int32
 
 func log(_ s: String) {
     let line = String(format: "%.3f ", ProcessInfo.processInfo.systemUptime) + "[PortraitPad] \(s)\n"
@@ -48,60 +40,35 @@ func sidecarScreen() -> NSScreen? {
     NSScreen.screens.first { $0.localizedName.localizedCaseInsensitiveContains("Sidecar") }
 }
 
-// Input that Sidecar delivers to its own (covered) screen, re-posted at the matching spot on the portrait
-// display. Needs Accessibility permission to post events.
+// Finger touches that Sidecar delivers to its own (covered) screen, re-posted at the matching spot on
+// the portrait display. Needs Accessibility permission to post events.
 //
-// Sidecar hands finger touches to AppKit gesture recognizers (as direct-touch events) rather than as
-// mouse events. Three recognizers share each touch:
-//   - a zero-delay press: only for taps (a short still touch clicks);
-//   - a pan: every drag. One finger scrolls the content under it (momentum on release); two fingers
-//     sideways switch Spaces / full-screen apps like the trackpad does, up and down scroll;
-//   - a two-finger pan: takes over when the plain pan gives up on a second finger.
-// Fingers rarely land together; when a second one lands early in a scroll, the drag is re-judged.
-final class InputView: NSView, NSGestureRecognizerDelegate {
+// Sidecar hands finger touches to AppKit gesture recognizers (as direct-touch events), not as mouse
+// events. One zero-delay press recognizer follows each touch: a short still touch clicks, a drag
+// scrolls the content under the finger (with momentum on release). Everything else is left alone:
+// multi-finger touches, and mouse/trackpad events on this hidden screen, so the real pointer is never
+// thrown around.
+final class InputView: NSView {
     var toPortrait: ((NSPoint) -> CGPoint?)?
 
-    static let tapSlop: CGFloat = 10            // movement (pt) before a touch becomes a scroll or swipe
+    static let tapSlop: CGFloat = 10            // movement (pt) before a touch becomes a scroll
     static let tapMaxDuration = 0.5             // longer still touches are ignored, not clicked
-    static let multiTapWindow = 0.45, multiTapSlop: CGFloat = 30
     static let momentumDecay: CGFloat = 0.965   // per frame at 60 Hz
     static let momentumMinSpeed: CGFloat = 150  // pt/s to start a fling; it stops below 20 pt/s
-    static let spaceSwipeDistance: CGFloat = 60 // pt sideways for a two-finger swipe to switch Spaces
-    static let rejudgeScroll: CGFloat = 80      // a scroll this short still turns into a swipe on a 2nd finger
-    static let pointerParkTime = 0.15           // s the pointer stays on the iPad for a Space switch
-    static let stallTimeout = 4.0               // s without updates mid-touch before tracking is reset
-
-    private enum Mode { case undecided, scroll, spaceSwipe, ignored }
 
     private let source = CGEventSource(stateID: .hidSystemState)
-    private var touchStart = NSPoint.zero, lastPoint = NSPoint.zero
-    private var mode = Mode.undecided, verticalLock = true, fingers = 1, scrolled: CGFloat = 0
+    private var touchStart = NSPoint.zero, touchStartTime = Date(), lastPoint = NSPoint.zero
+    private var ignoring = false, scrolling = false, verticalLock = true
     private var remainder = CGVector.zero                       // sub-point scroll left to post
     private var samples: [(t: TimeInterval, d: CGVector)] = []  // recent scroll deltas, for fling speed
     private var momentum: Timer?
-    private var lastTap: (time: Date, at: NSPoint, count: Int64)?
-    private var press: (start: NSPoint, time: Date, dragged: Bool)?
-    private var lastSpaceSwitch = Date.distantPast
-    private var watchdog: DispatchWorkItem?
-    private weak var active: NSGestureRecognizer?               // the drag recognizer that owns the touch
-    private var cursorHome: CGPoint?                            // pointer position while a touch borrows it
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        let tap = NSPressGestureRecognizer(target: self, action: #selector(trackTap(_:)))
-        tap.minimumPressDuration = 0
-        tap.allowableMovement = .greatestFiniteMagnitude
-        let drag = NSPanGestureRecognizer(target: self, action: #selector(trackDrag(_:)))
-        let twoFingerDrag = NSPanGestureRecognizer(target: self, action: #selector(trackDrag(_:)))
-        twoFingerDrag.numberOfTouchesRequired = 2
-        for g in [tap, drag, twoFingerDrag] {
-            g.delegate = self
-            addGestureRecognizer(g)
-        }
-    }
-
-    func gestureRecognizer(_ g: NSGestureRecognizer, shouldRecognizeSimultaneouslyWith other: NSGestureRecognizer) -> Bool {
-        true
+        let touch = NSPressGestureRecognizer(target: self, action: #selector(track(_:)))
+        touch.minimumPressDuration = 0
+        touch.allowableMovement = .greatestFiniteMagnitude
+        addGestureRecognizer(touch)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -110,102 +77,67 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
 
     // MARK: touch tracking
 
-    @objc private func trackTap(_ g: NSPressGestureRecognizer) {
+    @objc private func track(_ g: NSPressGestureRecognizer) {
         let p = g.location(in: self)
-        if debugInput { log("tap state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent()) }
+        if debugInput { log("touch state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent()) }
         switch g.state {
         case .began:
             stopMomentum()
-            press = (p, Date(), false)
-        case .ended:
-            guard let t = press, !t.dragged, touchCount() == 1, Date().timeIntervalSince(t.time) <= Self.tapMaxDuration,
-                  hypot(p.x - t.start.x, p.y - t.start.y) <= Self.tapSlop else { break }
-            click(at: t.start)
-        default:
-            break
-        }
-        if g.state == .ended || g.state == .cancelled { press = nil }
-    }
-
-    @objc private func trackDrag(_ g: NSPanGestureRecognizer) {
-        let p = g.location(in: self)
-        if debugInput {
-            log("drag[\(g.numberOfTouchesRequired)] state=\(g.state.rawValue) at=(\(Int(p.x)),\(Int(p.y))) " + describeCurrentEvent())
-        }
-        if g.state == .began {
-            guard active == nil else { return }             // the other drag recognizer already has it
-            active = g
-        } else if g !== active {
-            return
-        }
-        armWatchdog(g)
-        switch g.state {
-        case .began:
-            stopMomentum()
-            press?.dragged = true
-            let t = g.translation(in: self)
-            touchStart = NSPoint(x: p.x - t.x, y: p.y - t.y)  // where the finger landed
-            lastPoint = touchStart
-            fingers = max(g.numberOfTouchesRequired, touchCount())
-            mode = .undecided
+            ignoring = !isOneFinger()
+            touchStart = p
+            lastPoint = p
+            touchStartTime = Date()
+            scrolling = false
             remainder = .zero
             samples = []
-            scrolled = 0
-            fallthrough
         case .changed:
-            let n = touchCount()
-            if n > fingers {
-                fingers = n
-                // A second finger landing early in a scroll: the scroll was really the start of a swipe.
-                if mode == .scroll, scrolled < Self.rejudgeScroll {
-                    postScroll(.zero, phase: 4)
-                    mode = .undecided
-                    touchStart = p
-                    lastPoint = p
-                }
+            if ignoring { return }
+            if !isOneFinger() {                     // a second finger: stop here, do nothing more
+                endScroll(fling: false)
+                ignoring = true
+                return
             }
-            if mode == .undecided, hypot(p.x - touchStart.x, p.y - touchStart.y) > Self.tapSlop { decideMode(at: p) }
-            if mode == .scroll {
+            if !scrolling, hypot(p.x - touchStart.x, p.y - touchStart.y) > Self.tapSlop {
+                scrolling = true
+                let d = contentDelta(from: touchStart, to: p)
+                verticalLock = abs(d.dy) >= abs(d.dx)
+                pointCursor(at: touchStart)         // scroll events go to the window under the pointer
+                postScroll(.zero, phase: 1)         // began
+                lastPoint = touchStart              // the slop distance scrolls too, so nothing jumps
+            }
+            if scrolling {
                 let d = contentDelta(from: lastPoint, to: p)
                 postScroll(d, phase: 2)             // changed
                 samples.append((ProcessInfo.processInfo.systemUptime, d))
-                scrolled += abs(d.dx) + abs(d.dy)
+                lastPoint = p
             }
-            lastPoint = p
-        case .ended, .cancelled:
-            active = nil
-            switch mode {
-            case .scroll:
-                postScroll(.zero, phase: 4)         // ended
-                startMomentum(flingVelocity())
-                if momentum == nil { returnCursor() }
-            case .spaceSwipe:
-                finishSpaceSwipe()
-            case .undecided, .ignored:
-                break
+        case .ended:
+            if ignoring {
+                // nothing
+            } else if scrolling {
+                endScroll(fling: true)
+            } else if Date().timeIntervalSince(touchStartTime) <= Self.tapMaxDuration {
+                click(at: touchStart)
             }
-            mode = .undecided
+            ignoring = false
+        case .cancelled:                            // e.g. a second finger landed
+            if !ignoring { endScroll(fling: false) }
+            ignoring = false
         default:
             break
         }
     }
 
-    // Once a drag has moved: two fingers sideways switch Spaces, three or more do nothing, anything else scrolls.
-    private func decideMode(at p: NSPoint) {
-        let d = contentDelta(from: touchStart, to: p)
-        defer { if debugInput { log("decide fingers=\(fingers) sideways=\(Int(d.dx)) vertical=\(Int(d.dy)) -> \(mode)") } }
-        if fingers >= 3 {
-            mode = .ignored
-        } else if fingers == 2, abs(d.dx) > abs(d.dy) {
-            mode = .spaceSwipe
-        } else {
-            mode = .scroll
-            verticalLock = abs(d.dy) >= abs(d.dx)
-            borrowCursor()                          // scroll events go to the window under the pointer,
-            moveCursor(to: touchStart)              // so it moves there, hidden, and comes back afterwards
-            postScroll(.zero, phase: 1)             // began
-            lastPoint = touchStart                  // the slop distance scrolls too, so nothing jumps
-        }
+    private func isOneFinger() -> Bool {
+        guard let e = NSApp.currentEvent, e.type == .directTouch else { return false }   // not a finger
+        return e.allTouches().count == 1
+    }
+
+    private func endScroll(fling: Bool) {
+        guard scrolling else { return }
+        scrolling = false
+        postScroll(.zero, phase: 4)                 // ended
+        if fling { startMomentum(flingVelocity()) }
     }
 
     // Finger movement in this (landscape, y-up) view -> content movement on the portrait display.
@@ -213,127 +145,46 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
     // the finger; CGEvent scroll axis 1 is vertical (+ moves content down), axis 2 horizontal (+ right).
     private func contentDelta(from a: NSPoint, to b: NSPoint) -> CGVector {
         let d = CGVector(dx: b.y - a.y, dy: b.x - a.x)
-        guard mode == .scroll else { return d }
+        guard scrolling else { return d }
         return verticalLock ? CGVector(dx: 0, dy: d.dy) : CGVector(dx: d.dx, dy: 0)
-    }
-
-    private func touchCount() -> Int {
-        guard let e = NSApp.currentEvent, e.type == .directTouch else { return 1 }
-        return e.allTouches().count
-    }
-
-    // Like the trackpad's "swipe between full-screen applications": fingers left shows the Space on the
-    // right (Ctrl-→), fingers right the one on the left (Ctrl-←). Sent only after the fingers lift:
-    // switching mid-touch left the touch unfinished and froze all touch input.
-    private func finishSpaceSwipe() {
-        let d = contentDelta(from: touchStart, to: lastPoint)
-        if debugInput { log("space swipe sideways=\(Int(d.dx)) vertical=\(Int(d.dy))") }
-        guard abs(d.dx) > Self.spaceSwipeDistance, abs(d.dx) > abs(d.dy) * 1.5,
-              Date().timeIntervalSince(lastSpaceSwitch) > 0.4,   // one switch per swipe, even if handed over
-              let target = toPortrait?(touchStart), let ipad = portraitBounds(),
-              let home = CGEvent(source: nil)?.location else { return }
-        lastSpaceSwitch = Date()
-        let previous = NSWorkspace.shared.frontmostApplication
-        let key: CGKeyCode = d.dx < 0 ? 124 : 123
-        if ipad.contains(home) {
-            pressControlArrow(key)
-        } else {
-            // Space switching acts on the display under the pointer: park it on the iPad until the Dock has
-            // read it, then put it back. 30 ms worked in a quiet test but 50 ms sometimes missed.
-            borrowCursor()
-            CGWarpMouseCursorPosition(target)
-            pressControlArrow(key)
-            returnCursor(after: Self.pointerParkTime)
-            // The new Space activates its own app; keep the keyboard where you were working.
-            if let previous {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.restoreFocus(previous, ipad: ipad) }
-            }
-        }
-        if debugInput { log("space switch key=\(key) pointerParked=\(!ipad.contains(home))") }
-    }
-
-    private func portraitBounds() -> CGRect? {
-        guard let a = toPortrait?(.zero), let b = toPortrait?(NSPoint(x: bounds.width, y: bounds.height)) else { return nil }
-        return CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
-    }
-
-    // Re-activates `app` only while one of its windows is still visible off the iPad, so this never pulls
-    // the iPad back to the Space just left. Via Accessibility: a background app may not activate others.
-    private func restoreFocus(_ app: NSRunningApplication, ipad: CGRect) {
-        guard NSWorkspace.shared.frontmostApplication != app else { return }
-        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]] ?? []
-        let visibleElsewhere = windows.contains { w in
-            guard (w[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier,
-                  (w[kCGWindowLayer as String] as? Int) == 0,
-                  let dict = w[kCGWindowBounds as String] as? NSDictionary,
-                  let r = CGRect(dictionaryRepresentation: dict) else { return false }
-            return !ipad.contains(CGPoint(x: r.midX, y: r.midY))
-        }
-        guard visibleElsewhere else { return }
-        AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier),
-                                     kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-    }
-
-    // If a touch never reports an end (e.g. the system took over mid-gesture), the recognizer would ignore
-    // every later touch; resetting it ends the stuck touch (the action gets .cancelled) and frees it.
-    private func armWatchdog(_ g: NSGestureRecognizer) {
-        watchdog?.cancel()
-        watchdog = nil
-        guard g.state == .began || g.state == .changed else { return }
-        let w = DispatchWorkItem { [weak g] in
-            guard let g, g.state == .began || g.state == .changed else { return }
-            log("touch tracking stalled; resetting")
-            g.isEnabled = false
-            g.isEnabled = true
-        }
-        watchdog = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.stallTimeout, execute: w)
     }
 
     // MARK: posting
 
-    // Arrow keys carry the fn and numeric-pad flags on a real keyboard; the Mission Control hotkeys match on them.
-    // Pressed like a real keyboard: Control down, arrow down/up, Control up. Only flagging the arrow left
-    // Control "held" in the event source, so every later tap became a Control-click (a right-click).
-    private func pressControlArrow(_ keyCode: CGKeyCode) {
-        let control: CGKeyCode = 59
-        let arrowFlags: CGEventFlags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
-        for (key, down, flags) in [(control, true, CGEventFlags.maskControl), (keyCode, true, arrowFlags),
-                                   (keyCode, false, arrowFlags), (control, false, [])] {
-            guard let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else { continue }
-            e.flags = flags
-            e.post(tap: .cghidEventTap)
-        }
-    }
-
-    // Modifier keys really held on the keyboard (so Cmd-tap still works), never leftovers from posted keys.
+    // Modifier keys really held on the keyboard (Cmd-tap still works), nothing else.
     private func heldModifiers() -> CGEventFlags {
         CGEventSource.flagsState(.combinedSessionState)
             .intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
     }
 
-    private func moveCursor(to viewPoint: NSPoint) {
-        guard let p = toPortrait?(viewPoint) else { return }
+    // Moves the pointer under the finger only when it isn't already over the window being touched,
+    // so scrolling on the iPad usually leaves the pointer where it is.
+    private func pointCursor(at viewPoint: NSPoint) {
+        guard let p = toPortrait?(viewPoint), let here = CGEvent(source: nil)?.location else { return }
+        if let target = windowNumber(at: p), target == windowNumber(at: here) { return }
         guard let e = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left)
         else { return }
         e.flags = heldModifiers()
         e.post(tap: .cghidEventTap)
     }
 
+    private func windowNumber(at p: CGPoint) -> Int? {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        for w in windows where (w[kCGWindowLayer as String] as? Int) == 0 {
+            guard let dict = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: dict), r.contains(p) else { continue }
+            return w[kCGWindowNumber as String] as? Int
+        }
+        return nil
+    }
+
     private func click(at viewPoint: NSPoint) {
         guard let p = toPortrait?(viewPoint) else { return }
-        let now = Date()
-        var count: Int64 = 1
-        if let last = lastTap, now.timeIntervalSince(last.time) < Self.multiTapWindow,
-           hypot(viewPoint.x - last.at.x, viewPoint.y - last.at.y) < Self.multiTapSlop {
-            count = min(last.count + 1, 3)          // double-tap selects a word, triple a line
-        }
-        lastTap = (now, viewPoint, count)
         for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
             guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: .left)
             else { continue }
-            if type != .mouseMoved { e.setIntegerValueField(.mouseEventClickState, value: count) }
+            if type != .mouseMoved { e.setIntegerValueField(.mouseEventClickState, value: 1) }
             e.flags = heldModifiers()
             e.post(tap: .cghidEventTap)
         }
@@ -379,7 +230,7 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
             self.postScroll(CGVector(dx: velocity.dx / 60, dy: velocity.dy / 60), phase: 0, momentum: phase)
             phase = 2
         }
-        RunLoop.main.add(timer, forMode: .common)   // keeps running while AppKit tracks a new gesture
+        RunLoop.main.add(timer, forMode: .common)   // keeps running while AppKit tracks a new touch
         momentum = timer
     }
 
@@ -388,58 +239,6 @@ final class InputView: NSView, NSGestureRecognizerDelegate {
         timer.invalidate()
         momentum = nil
         postScroll(.zero, phase: 0, momentum: 3)
-        returnCursor()
-    }
-
-    // MARK: pointer borrowing
-
-    // Hides the pointer and remembers where it was; a touch can then move it (scroll routing, Space
-    // switching) without it visibly jumping or flickering.
-    private func borrowCursor() {
-        guard cursorHome == nil, let home = CGEvent(source: nil)?.location else { return }
-        cursorHome = home
-        CGDisplayHideCursor(CGMainDisplayID())
-    }
-
-    // Puts the pointer back and shows it, a moment later so already-posted scroll events still reach
-    // the window they were meant for.
-    private func returnCursor(after delay: TimeInterval = 0.05) {
-        guard let home = cursorHome else { return }
-        cursorHome = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            CGWarpMouseCursorPosition(home)
-            CGAssociateMouseAndMouseCursorPosition(1)   // no brief pointer freeze after the warp
-            CGDisplayShowCursor(CGMainDisplayID())
-        }
-    }
-
-    // MARK: trackpad/mouse that wanders onto the Sidecar screen
-
-    // The pointer jumps to the matching spot on the portrait display.
-    override func mouseMoved(with e: NSEvent) {
-        guard let cg = e.cgEvent?.copy(), let p = toPortrait?(e.locationInWindow) else { return }
-        cg.location = p
-        cg.post(tap: .cghidEventTap)
-    }
-
-    // Two-finger trackpad scroll: axes turn with the image (see contentDelta).
-    override func scrollWheel(with e: NSEvent) {
-        guard let cg = e.cgEvent?.copy(), let p = toPortrait?(e.locationInWindow) else { return }
-        cg.location = p
-        let pairs: [(CGEventField, CGEventField)] = [
-            (.scrollWheelEventDeltaAxis1, .scrollWheelEventDeltaAxis2),
-            (.scrollWheelEventPointDeltaAxis1, .scrollWheelEventPointDeltaAxis2),
-        ]
-        for (v, h) in pairs {
-            let lv = cg.getIntegerValueField(v), lh = cg.getIntegerValueField(h)
-            cg.setIntegerValueField(v, value: lh)
-            cg.setIntegerValueField(h, value: -lv)
-        }
-        let fv = cg.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
-        let fh = cg.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2)
-        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: fh)
-        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: -fv)
-        cg.post(tap: .cghidEventTap)
     }
 }
 
@@ -451,6 +250,7 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private let frameQueue = DispatchQueue(label: "portraitpad.frames", qos: .userInteractive)
     private(set) var running = false
     private var starting = false
+    private var lastPark: String?                      // last parking attempt, so a refused spot isn't retried
 
     // MARK: lifecycle
 
@@ -463,7 +263,8 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
         } else if let sidecar, running {
             window?.setFrame(sidecar.frame, display: true)   // Sidecar resized or moved
             layoutVideoLayer()
-            saveArrangement(sidecar: displayID(of: sidecar))
+            saveArrangement()
+            parkSidecar(displayID(of: sidecar))
         }
     }
 
@@ -531,43 +332,68 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
         log("mode \(want.width)x\(want.height)@\(want.pixelWidth): \(err == .success ? "ok" : "error \(err.rawValue)")")
     }
 
-    // Restores the arrangement last set in System Settings ▸ Displays ▸ Arrange (origins relative to
-    // the main display). First run: portrait display directly above the Mac, the real Sidecar desktop
-    // parked beside it, not touching the Mac, so the pointer can't stray there.
+    // Puts the portrait display where it was last dragged in System Settings ▸ Displays ▸ Arrange (first
+    // run: directly above the Mac), and parks the hidden Sidecar desktop out of the pointer's way.
     private func arrange(vd: CGDirectDisplayID, sidecar: CGDirectDisplayID) {
         let main = CGDisplayBounds(CGMainDisplayID())
-        let vdOrigin: (Int32, Int32), scOrigin: (Int32, Int32)
-        if let v = savedOrigin(vdOriginKey), let s = savedOrigin(sidecarOriginKey) {
-            vdOrigin = v
-            scOrigin = s
-        } else {
-            let vdX = Int32(main.midX) - Int32(pointsW / 2), vdY = Int32(main.minY) - Int32(pointsH)
-            vdOrigin = (vdX, vdY)
-            scOrigin = (vdX - Int32(CGDisplayBounds(sidecar).width), vdY)
-        }
+        let origin = savedOrigin(vdOriginKey)
+            ?? (Int32(main.midX) - Int32(pointsW / 2), Int32(main.minY) - Int32(pointsH))
+        let vdRect = CGRect(x: CGFloat(origin.0), y: CGFloat(origin.1), width: CGFloat(pointsW), height: CGFloat(pointsH))
         var cfg: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&cfg)
-        CGConfigureDisplayOrigin(cfg, vd, vdOrigin.0, vdOrigin.1)
-        CGConfigureDisplayOrigin(cfg, sidecar, scOrigin.0, scOrigin.1)
+        CGConfigureDisplayOrigin(cfg, vd, origin.0, origin.1)
+        if let park = parkingSpot(vd: vdRect, sidecar: CGDisplayBounds(sidecar).size) {
+            CGConfigureDisplayOrigin(cfg, sidecar, Int32(park.x), Int32(park.y))
+        }
         CGCompleteDisplayConfiguration(cfg, .forSession)
-        log("arranged: portrait at \(vdOrigin), sidecar at \(scOrigin)")
+        log("arranged: portrait at \(origin)")
     }
 
-    // Called once screen changes settle while streaming, so whatever the user dragged last becomes the default.
-    private func saveArrangement(sidecar: CGDirectDisplayID) {
+    // Called once screen changes settle while streaming, so wherever the portrait display was dragged last
+    // becomes the default.
+    private func saveArrangement() {
         guard let vd = virtualDisplay?.displayID else { return }
-        let v = CGDisplayBounds(vd).origin, s = CGDisplayBounds(sidecar).origin
-        let d = UserDefaults.standard
-        let newV = [Int(v.x), Int(v.y)], newS = [Int(s.x), Int(s.y)]
-        guard d.array(forKey: vdOriginKey) as? [Int] != newV || d.array(forKey: sidecarOriginKey) as? [Int] != newS else { return }
-        d.set(newV, forKey: vdOriginKey)
-        d.set(newS, forKey: sidecarOriginKey)
-        log("saved arrangement: portrait at \(newV), sidecar at \(newS)")
+        let o = CGDisplayBounds(vd).origin, value = [Int(o.x), Int(o.y)]
+        guard UserDefaults.standard.array(forKey: vdOriginKey) as? [Int] != value else { return }
+        UserDefaults.standard.set(value, forKey: vdOriginKey)
+        log("saved arrangement: portrait at \(value)")
     }
 
     private func savedOrigin(_ key: String) -> (Int32, Int32)? {
         guard let a = UserDefaults.standard.array(forKey: key) as? [Int], a.count == 2 else { return nil }
         return (Int32(a[0]), Int32(a[1]))
+    }
+
+    // The real Sidecar desktop sits hidden under the stream. Wherever the portrait display goes, keep the
+    // Sidecar screen touching it only at the outer corner farthest from the Mac, never along an edge of
+    // the Mac's screen: otherwise the pointer slips onto it (invisible) between the Mac and the iPad.
+    private func parkSidecar(_ sidecar: CGDirectDisplayID) {
+        guard let vd = virtualDisplay?.displayID else { return }
+        let vdRect = CGDisplayBounds(vd), current = CGDisplayBounds(sidecar)
+        guard let park = parkingSpot(vd: vdRect, sidecar: current.size), park != current.origin else { return }
+        let attempt = "\(vdRect.origin) \(park)"
+        guard lastPark != attempt else { return }          // macOS refused this spot already: don't loop
+        lastPark = attempt
+        var cfg: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&cfg)
+        CGConfigureDisplayOrigin(cfg, sidecar, Int32(park.x), Int32(park.y))
+        CGCompleteDisplayConfiguration(cfg, .forSession)
+        log("parked sidecar at \(park)")
+    }
+
+    private func parkingSpot(vd v: CGRect, sidecar s: CGSize) -> CGPoint? {
+        let main = CGDisplayBounds(CGMainDisplayID())
+        func overlap(_ a0: CGFloat, _ a1: CGFloat, _ b0: CGFloat, _ b1: CGFloat) -> CGFloat { min(a1, b1) - max(a0, b0) }
+        func usable(_ r: CGRect) -> Bool {
+            let mx = overlap(r.minX, r.maxX, main.minX, main.maxX), my = overlap(r.minY, r.maxY, main.minY, main.maxY)
+            if mx >= 0, my >= 0, mx > 0 || my > 0 { return false }   // overlaps or shares an edge with the Mac
+            return !(overlap(r.minX, r.maxX, v.minX, v.maxX) > 0 && overlap(r.minY, r.maxY, v.minY, v.maxY) > 0)
+        }
+        let corners = [CGPoint(x: v.minX - s.width, y: v.minY - s.height), CGPoint(x: v.maxX, y: v.minY - s.height),
+                       CGPoint(x: v.minX - s.width, y: v.maxY), CGPoint(x: v.maxX, y: v.maxY)]
+        return corners.map { CGRect(origin: $0, size: s) }.filter(usable)
+            .max { hypot($0.midX - main.midX, $0.midY - main.midY) < hypot($1.midX - main.midX, $1.midY - main.midY) }?
+            .origin
     }
 
     // MARK: output window on the Sidecar screen
@@ -577,7 +403,6 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
         let w = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         w.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
-        w.acceptsMouseMovedEvents = true
         w.isOpaque = true
         w.hasShadow = false
         w.backgroundColor = .black
@@ -693,8 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = menu
         statusItem = item
 
-        let cid = _CGSDefaultConnection()
-        _ = CGSSetConnectionProperty(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+        UserDefaults.standard.removeObject(forKey: "sidecarOrigin")   // older versions saved it; now always parked
 
         // Touch forwarding posts events, which macOS only allows with Accessibility permission.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -703,7 +527,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in self?.scheduleSync() }
         streamer.sync()
-        if debugEvents { startInputDebugging() }
     }
 
     // Screen changes arrive in bursts (including the ones we cause ourselves); act once they settle.
@@ -715,31 +538,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ n: Notification) { streamer.stop() }
-
-    var debugTap: CFMachPort?
-
-    func startInputDebugging() {
-        log("input debugging on")
-        _ = NSEvent.addLocalMonitorForEvents(matching: .any) { e in
-            if e.type != .mouseMoved { log("local event " + describe(e)) }
-            return e
-        }
-        // Keys anyone posts (does Sidecar turn a 3-finger swipe into Cmd-Z?) and gesture/swipe events.
-        let cb: CGEventTapCallBack = { _, type, e, _ in
-            if [10, 11, 12, 29, 30, 31].contains(type.rawValue) {
-                log("tap type=\(type.rawValue) key=\(e.getIntegerValueField(.keyboardEventKeycode)) flags=\(String(e.flags.rawValue, radix: 16)) pid=\(e.getIntegerValueField(.eventSourceUnixProcessID)) at=(\(Int(e.location.x)),\(Int(e.location.y)))")
-            }
-            return Unmanaged.passUnretained(e)
-        }
-        if let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,
-                                       eventsOfInterest: CGEventMask.max, callback: cb, userInfo: nil) {
-            CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-            debugTap = tap
-        } else {
-            log("debug event tap unavailable")
-        }
-    }
 }
 
 let touchTypes: Set<UInt> = [18, 19, 20, 29, 30, 31, 32, 37]
