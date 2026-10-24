@@ -250,7 +250,7 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private let frameQueue = DispatchQueue(label: "portraitpad.frames", qos: .userInteractive)
     private(set) var running = false
     private var starting = false
-    private var lastPark: String?                      // last parking attempt, so a refused spot isn't retried
+    private var parkTries = (spot: "", count: 0, since: Date.distantPast)   // retries of one parking spot
 
     // MARK: lifecycle
 
@@ -370,10 +370,14 @@ final class Streamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private func parkSidecar(_ sidecar: CGDirectDisplayID) {
         guard let vd = virtualDisplay?.displayID else { return }
         let vdRect = CGDisplayBounds(vd), current = CGDisplayBounds(sidecar)
-        guard let park = parkingSpot(vd: vdRect, sidecar: current.size), park != current.origin else { return }
-        let attempt = "\(vdRect.origin) \(park)"
-        guard lastPark != attempt else { return }          // macOS refused this spot already: don't loop
-        lastPark = attempt
+        guard let park = parkingSpot(vd: vdRect, sidecar: current.size) else { return }
+        guard park != current.origin else { parkTries.count = 0; return }
+        // Something else may move it again (System Settings applies its own copy of the arrangement when
+        // its Arrange sheet closes), so retry; but give up on a spot macOS keeps refusing, to avoid a loop.
+        let spot = "\(vdRect.origin) \(park)"
+        if parkTries.spot != spot || Date().timeIntervalSince(parkTries.since) > 30 { parkTries = (spot, 0, Date()) }
+        guard parkTries.count < 3 else { return }
+        parkTries.count += 1
         var cfg: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&cfg)
         CGConfigureDisplayOrigin(cfg, sidecar, Int32(park.x), Int32(park.y))
