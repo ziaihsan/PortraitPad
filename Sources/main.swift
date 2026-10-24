@@ -50,17 +50,20 @@ func sidecarScreen() -> NSScreen? {
 // the portrait display. Needs Accessibility permission to post events.
 //
 // Sidecar hands finger touches to AppKit gesture recognizers (as direct-touch events), not as mouse
-// events. One zero-delay press recognizer follows each touch: a short still touch clicks, a drag
-// scrolls the content under the finger (with momentum on release). Everything else is left alone:
-// multi-finger touches, and mouse/trackpad events on this hidden screen, so the real pointer is never
-// thrown around.
-final class InputView: NSView {
+// events. A zero-delay press recognizer follows one-finger touches: a short still touch clicks, a drag
+// scrolls the content under the finger (with momentum on release). A two-finger pan recognizer handles
+// one gesture only: a sideways swipe switches Spaces / full-screen apps (Ctrl-arrow) once the fingers
+// lift. Everything else is left alone, including mouse/trackpad events on this hidden screen, so the
+// real pointer is never thrown around.
+final class InputView: NSView, NSGestureRecognizerDelegate {
     var toPortrait: ((NSPoint) -> CGPoint?)?
 
     static let tapSlop: CGFloat = 10            // movement (pt) before a touch becomes a scroll
     static let tapMaxDuration = 0.5             // longer still touches are ignored, not clicked
     static let momentumDecay: CGFloat = 0.965   // per frame at 60 Hz
     static let momentumMinSpeed: CGFloat = 150  // pt/s to start a fling; it stops below 20 pt/s
+    static let spaceSwipeDistance: CGFloat = 60 // pt sideways for a two-finger swipe to switch Spaces
+    static let pointerParkTime = 0.15           // s the lent pointer stays on the iPad for a Space switch
 
     private let source = CGEventSource(stateID: .hidSystemState)
     private var touchStart = NSPoint.zero, touchStartTime = Date(), lastPoint = NSPoint.zero
@@ -70,13 +73,23 @@ final class InputView: NSView {
     private var momentum: Timer?
     private var lent: (home: CGPoint, spot: CGPoint, since: Date)?   // pointer lent to a scroll (see lendCursor)
     private var lentWatch: Timer?
+    private var swiping = false                                 // a two-finger touch is being followed
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         let touch = NSPressGestureRecognizer(target: self, action: #selector(track(_:)))
         touch.minimumPressDuration = 0
         touch.allowableMovement = .greatestFiniteMagnitude
+        touch.delegate = self
         addGestureRecognizer(touch)
+        let twoFingers = NSPanGestureRecognizer(target: self, action: #selector(trackTwoFingers(_:)))
+        twoFingers.numberOfTouchesRequired = 2
+        twoFingers.delegate = self
+        addGestureRecognizer(twoFingers)
+    }
+
+    func gestureRecognizer(_ g: NSGestureRecognizer, shouldRecognizeSimultaneouslyWith other: NSGestureRecognizer) -> Bool {
+        true
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -109,7 +122,11 @@ final class InputView: NSView {
                 scrolling = true
                 let d = contentDelta(from: touchStart, to: p)
                 verticalLock = abs(d.dy) >= abs(d.dx)
-                lendCursor(to: touchStart)          // scroll events go to the window under the pointer
+                // Scroll events go to the window under the pointer: lend it unless it is over that window.
+                lendCursor(to: touchStart) { [weak self] spot, home in
+                    guard let self, let w = self.windowNumber(at: spot) else { return false }
+                    return w == self.windowNumber(at: home)
+                }
                 postScroll(.zero, phase: 1)         // began
                 lastPoint = touchStart              // the slop distance scrolls too, so nothing jumps
             }
@@ -136,6 +153,43 @@ final class InputView: NSView {
         }
     }
 
+    // Two fingers: only a sideways swipe does something, and only after the fingers lift (switching
+    // Spaces mid-touch once left the touch unfinished and froze all touch input).
+    @objc private func trackTwoFingers(_ g: NSPanGestureRecognizer) {
+        if debugInput { log("two fingers state=\(g.state.rawValue) t=\(g.translation(in: self)) " + describeCurrentEvent()) }
+        switch g.state {
+        case .began:
+            swiping = NSApp.currentEvent?.type == .directTouch   // fingers only, never a mouse
+        case .ended:
+            guard swiping else { break }
+            swiping = false
+            let t = g.translation(in: self)
+            let sideways = t.y, vertical = t.x                  // portrait axes (see contentDelta)
+            guard abs(sideways) > Self.spaceSwipeDistance, abs(sideways) > abs(vertical) * 1.5 else { break }
+            // Like the trackpad's "swipe between full-screen applications": fingers left shows the Space
+            // on the right (Ctrl-→), fingers right the one on the left (Ctrl-←).
+            switchSpace(sideways < 0 ? 124 : 123, at: g.location(in: self))
+        case .cancelled, .failed:
+            swiping = false
+        default:
+            break
+        }
+    }
+
+    // Space hotkeys act on the display under the pointer (a key event's own location is ignored), so if
+    // the pointer is elsewhere it is lent to the iPad for a moment, hidden, the same way a scroll lends it.
+    private func switchSpace(_ key: CGKeyCode, at viewPoint: NSPoint) {
+        lendCursor(to: viewPoint) { [weak self] _, home in self?.portraitBounds()?.contains(home) == true }
+        pressControlArrow(key)
+        giveCursorBack(after: Self.pointerParkTime)
+        if debugInput { log("space switch key=\(key)") }
+    }
+
+    private func portraitBounds() -> CGRect? {
+        guard let a = toPortrait?(.zero), let b = toPortrait?(NSPoint(x: bounds.width, y: bounds.height)) else { return nil }
+        return CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
+    }
+
     private func isOneFinger() -> Bool {
         guard let e = NSApp.currentEvent, e.type == .directTouch else { return false }   // not a finger
         return e.allTouches().count == 1
@@ -160,22 +214,37 @@ final class InputView: NSView {
 
     // MARK: posting
 
+    // Pressed like a real keyboard: Control down, arrow down/up, Control up. Flagging only the arrow left
+    // Control "held" in the event source and turned later taps into right-clicks. Arrow keys carry the fn
+    // and numeric-pad flags on a real keyboard; the Mission Control hotkeys match on them.
+    private func pressControlArrow(_ keyCode: CGKeyCode) {
+        let control: CGKeyCode = 59
+        let arrowFlags: CGEventFlags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+        for (key, down, flags) in [(control, true, CGEventFlags.maskControl), (keyCode, true, arrowFlags),
+                                   (keyCode, false, arrowFlags), (control, false, [])] {
+            guard let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else { continue }
+            e.flags = flags
+            e.post(tap: .cghidEventTap)
+        }
+    }
+
     // Modifier keys really held on the keyboard (Cmd-tap still works), nothing else.
     private func heldModifiers() -> CGEventFlags {
         CGEventSource.flagsState(.combinedSessionState)
             .intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
     }
 
-    // MARK: lending the pointer to a scroll
+    // MARK: lending the pointer
 
-    // macOS sends scroll events to the window under the pointer, and apps like Claude (Electron) ignore
-    // scrolls posted to them directly. So when the pointer isn't already over the touched window, it is
-    // lent to the scroll: hidden, put under the finger, and given back when the scroll and its momentum
-    // end. On screen it never leaves where you had it. Moving the trackpad or mouse meanwhile takes it back
-    // at once (the scroll stops), so it is never dragged away from you; after 6 s it is returned regardless.
-    private func lendCursor(to viewPoint: NSPoint) {
+    // macOS sends scroll events to the window under the pointer (apps like Claude, on Electron, ignore
+    // scrolls posted to them directly) and switches Spaces on the display under it. So when a touch needs
+    // the pointer and `keep` says it can't stay where it is, it is lent: hidden, put under the finger, and
+    // given back when the scroll and its momentum (or the Space switch) end. On screen it never leaves
+    // where you had it. Moving the trackpad or mouse meanwhile takes it back at once (a scroll stops), so
+    // it is never dragged away from you; after 6 s it is returned regardless.
+    private func lendCursor(to viewPoint: NSPoint, keep: (_ spot: CGPoint, _ home: CGPoint) -> Bool) {
         guard lent == nil, let spot = toPortrait?(viewPoint), let home = CGEvent(source: nil)?.location else { return }
-        if let target = windowNumber(at: spot), target == windowNumber(at: home) { return }
+        if keep(spot, home) { return }
         lent = (home, spot, Date())
         CGDisplayHideCursor(CGMainDisplayID())
         CGWarpMouseCursorPosition(spot)
@@ -189,7 +258,7 @@ final class InputView: NSView {
         guard let l = lent, let now = CGEvent(source: nil)?.location else { return }
         let moved = hypot(now.x - l.spot.x, now.y - l.spot.y) > 2
         guard moved || Date().timeIntervalSince(l.since) > 6 else { return }
-        if moved { log("pointer moved during a scroll; giving it back") }
+        if moved { log("pointer moved while lent; giving it back") }
         if scrolling {                              // stop scrolling: it would now hit whatever is under the pointer
             postScroll(.zero, phase: 4)
             scrolling = false

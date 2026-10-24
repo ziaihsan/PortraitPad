@@ -6,6 +6,16 @@ satu tugas ini saja, tanpa aplikasi berbayar.
 
 Diuji di macOS 27.0.1, MacBook Air M1, iPad Pro 12.9" (M1).
 
+## Versi
+
+- **`main`**: portrait, ketuk = klik, scroll 1 jari, dan swipe 2 jari untuk pindah Space.
+- **Tag `v1-konservatif`**: versi yang lebih konservatif dan paling aman, **tanpa** swipe 2 jari
+  (tidak ada tombol Ctrl yang dikirim). Kalau swipe menimbulkan masalah, kembali ke versi ini:
+
+  ```bash
+  git checkout v1-konservatif && ./build.sh   # lalu pasang ulang seperti di bawah
+  ```
+
 ## Cara kerja
 
 ```
@@ -28,13 +38,16 @@ Tidak ada salinan piksel lewat CPU. Saat diam sekitar 0,5–0,7% CPU dan ~15–3
 |---|---|
 | Ketuk 1 jari | Klik kiri di titik itu |
 | 1 jari geser (langsung atau setelah ditahan) | Scroll mengikuti jari, dengan momentum |
-| 2 jari atau lebih | Diabaikan |
+| 2 jari geser ke kiri / kanan, lalu angkat | Pindah Space / aplikasi full-screen di layar iPad (Ctrl+→ / Ctrl+←) |
+| Gerakan 2 jari lainnya, 3 jari atau lebih | Diabaikan |
 
 Gerakan trackpad dan mouse tidak pernah diubah. Scroll tidak memindah pointer: macOS mengirim
 scroll ke jendela di bawah pointer (dan aplikasi Electron seperti Claude mengabaikan scroll yang
 dikirim langsung), jadi kalau pointer tidak sedang di atas jendela yang disentuh, pointer
 "dipinjam" dalam keadaan tersembunyi lalu dikembalikan setelah scroll dan momentum selesai.
 Menggerakkan trackpad selama itu langsung mengembalikan pointer dan menghentikan scroll.
+Swipe 2 jari meminjam pointer dengan cara yang sama (150 ms), karena macOS memindah Space di layar
+tempat pointer berada.
 
 Sidecar mengirim sentuhan jari ke *gesture recognizer* AppKit (event `directTouch`), bukan sebagai
 event mouse. Lihat komentar di `InputView` (`Sources/main.swift`) untuk detailnya.
