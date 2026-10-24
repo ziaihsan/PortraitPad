@@ -17,23 +17,22 @@ layar virtual "PortraitPad" 984×1312 pt, HiDPI, 60 Hz   (CGVirtualDisplay, API 
 Tidak ada salinan piksel lewat CPU. Saat diam sekitar 0,5–0,7% CPU dan ~15–30 MB RAM.
 
 - Menyala/mati otomatis saat Sidecar tersambung/putus.
-- Susunan layar terakhir (System Settings ▸ Displays ▸ Arrange) diingat dan dipakai lagi.
+- Posisi layar iPad terakhir (System Settings ▸ Displays ▸ Arrange) diingat dan dipakai lagi.
+- Layar Sidecar asli (tersembunyi di belakang stream) selalu diparkir otomatis di sudut luar layar
+  iPad, jauh dari Mac, supaya pointer tidak tersesat ke sana. Kalau ada yang memindahkannya
+  (misalnya System Settings saat Arrange ditutup), PortraitPad mengembalikannya.
 
 ## Gestur sentuh di iPad
 
 | Gerakan | Hasil |
 |---|---|
-| Ketuk 1 jari | Klik di titik itu |
-| Ketuk 2× / 3× cepat | Double / triple click |
+| Ketuk 1 jari | Klik kiri di titik itu |
 | 1 jari geser (langsung atau setelah ditahan) | Scroll mengikuti jari, dengan momentum |
-| 2 jari geser atas/bawah | Scroll |
-| 2 jari geser ke kiri / kanan | Pindah Space / aplikasi full-screen (Ctrl+→ / Ctrl+←) di layar iPad, dikirim setelah jari diangkat |
-| 3 jari atau lebih | Diabaikan |
+| 2 jari atau lebih | Diabaikan |
 
-Saat scroll dan swipe, pointer tidak terlihat bergerak. macOS mengirim scroll ke jendela di bawah
-pointer dan memindah Space di layar tempat pointer berada, jadi pointer dipindah sementara dalam
-keadaan tersembunyi, lalu dikembalikan ke posisi semula. Fokus keyboard juga dikembalikan kalau
-pointer tadinya di layar lain.
+Gerakan trackpad dan mouse tidak pernah diubah. Saat scroll, pointer hanya dipindah ke bawah jari
+kalau belum berada di atas jendela yang disentuh, karena macOS mengirim scroll ke jendela di bawah
+pointer.
 
 Sidecar mengirim sentuhan jari ke *gesture recognizer* AppKit (event `directTouch`), bukan sebagai
 event mouse. Lihat komentar di `InputView` (`Sources/main.swift`) untuk detailnya.
@@ -92,12 +91,11 @@ Saat `codesign` pertama kali memakai kunci ini, macOS meminta password login. Pi
 ## Debug
 
 ```bash
-defaults write local.z.PortraitPad debugInput -bool true    # catat tiap sentuhan dan keputusan gestur
-defaults write local.z.PortraitPad debugEvents -bool true   # + semua event sistem (berat, bikin lag)
+defaults write local.z.PortraitPad debugInput -bool true    # catat tiap sentuhan
 tail -f ~/Library/Logs/PortraitPad.log
 ```
 
-Matikan lagi dengan `defaults delete local.z.PortraitPad debugInput` (atau `debugEvents`), lalu
+Matikan lagi dengan `defaults delete local.z.PortraitPad debugInput`, lalu
 jalankan ulang aplikasinya.
 
 `Tools/eventprobe.swift` adalah alat terpisah yang dipakai untuk mencari tahu apa yang sebenarnya
@@ -111,6 +109,5 @@ build/eventprobe --cursortest > probe.log    # juga: --passive, --level=N
 ## Batasan
 
 - Sidecar dikunci Apple di **60 Hz**. Layar ProMotion 120 Hz tidak bisa dipakai lewat jalur ini.
-- `CGVirtualDisplay` dan properti `SetsCursorInBackground` (untuk menyembunyikan pointer dari latar
-  belakang) adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih jalan di macOS 27).
+- `CGVirtualDisplay` adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih jalan di macOS 27).
 - Desktop Sidecar asli tetap ada di belakang stream. Jendela yang terseret ke sana tidak terlihat.
