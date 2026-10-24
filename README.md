@@ -30,9 +30,11 @@ Tidak ada salinan piksel lewat CPU. Saat diam sekitar 0,5–0,7% CPU dan ~15–3
 | 1 jari geser (langsung atau setelah ditahan) | Scroll mengikuti jari, dengan momentum |
 | 2 jari atau lebih | Diabaikan |
 
-Gerakan trackpad dan mouse tidak pernah diubah. Saat scroll, pointer hanya dipindah ke bawah jari
-kalau belum berada di atas jendela yang disentuh, karena macOS mengirim scroll ke jendela di bawah
-pointer.
+Gerakan trackpad dan mouse tidak pernah diubah. Scroll tidak memindah pointer: macOS mengirim
+scroll ke jendela di bawah pointer (dan aplikasi Electron seperti Claude mengabaikan scroll yang
+dikirim langsung), jadi kalau pointer tidak sedang di atas jendela yang disentuh, pointer
+"dipinjam" dalam keadaan tersembunyi lalu dikembalikan setelah scroll dan momentum selesai.
+Menggerakkan trackpad selama itu langsung mengembalikan pointer dan menghentikan scroll.
 
 Sidecar mengirim sentuhan jari ke *gesture recognizer* AppKit (event `directTouch`), bukan sebagai
 event mouse. Lihat komentar di `InputView` (`Sources/main.swift`) untuk detailnya.
@@ -109,5 +111,6 @@ build/eventprobe --cursortest > probe.log    # juga: --passive, --level=N
 ## Batasan
 
 - Sidecar dikunci Apple di **60 Hz**. Layar ProMotion 120 Hz tidak bisa dipakai lewat jalur ini.
-- `CGVirtualDisplay` adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih jalan di macOS 27).
+- `CGVirtualDisplay` dan properti `SetsCursorInBackground` (menyembunyikan pointer dari latar belakang)
+  adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih jalan di macOS 27).
 - Desktop Sidecar asli tetap ada di belakang stream. Jendela yang terseret ke sana tidak terlihat.
