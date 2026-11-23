@@ -1,26 +1,26 @@
-# Cara memasang PortraitPad (dari nol)
+# Setting up PortraitPad
 
-Langkah ini memasang PortraitPad ke `~/Applications` supaya bisa dibuka lewat Spotlight.
-Aplikasi **tidak** dijalankan otomatis saat login. Ia hanya jalan saat kamu membukanya sendiri.
+These steps install PortraitPad in `~/Applications` so you can open it from Spotlight. It will not
+start when you log in; it runs only when you open it.
 
-Terakhir dicoba: 24 Nov 2026, macOS 27.2.1, Swift 6.4.2 (Command Line Tools).
+Last checked on 24 November 2026 with macOS 27.2.1 and Swift 6.4.2 (Command Line Tools).
 
-## 1. Clone dan build
+## 1. Build
 
 ```bash
 cd /tmp
-gh repo clone ziaihsan/PortraitPad
+git clone https://github.com/ziaihsan/PortraitPad.git
 cd PortraitPad
 ./build.sh
 ```
 
-Hasilnya `build/PortraitPad.app`. Peringatan `numberOfTouchesRequired was deprecated` boleh diabaikan.
+The app is built at `build/PortraitPad.app`. You can ignore the warning
+`'numberOfTouchesRequired' was deprecated`.
 
-Kalau muncul `'PortraitPad Local Signing' not in keychain, signing ad-hoc`, aplikasinya tetap jalan,
-tapi izin harus diberikan ulang setiap kali build ulang. Untuk mencegahnya, buat sertifikatnya
-sekali (lihat README, bagian "Sertifikat tanda tangan lokal").
+If you see `'PortraitPad Local Signing' not in keychain, signing ad-hoc`, the app still works, but
+macOS will ask for its permissions again after every rebuild. Step 5 fixes this.
 
-## 2. Pasang ke Applications
+## 2. Install
 
 ```bash
 osascript -e 'quit app "PortraitPad"' 2>/dev/null
@@ -29,37 +29,65 @@ rm -rf ~/Applications/PortraitPad.app
 cp -R build/PortraitPad.app ~/Applications/
 ```
 
-Setelah itu hapus folder hasil clone supaya Spotlight tidak menampilkan dua "PortraitPad":
+Delete the cloned folder afterwards. Otherwise Spotlight shows two apps named PortraitPad:
 
 ```bash
 cd ~ && rm -rf /tmp/PortraitPad
 ```
 
-Jangan tambahkan ke Login Items kalau tidak ingin aplikasinya jalan otomatis.
+## 3. Use it
 
-## 3. Pemakaian
+1. Connect your iPad with Sidecar: Control Center ▸ Screen Mirroring ▸ your iPad, as an extended
+   display.
+2. Open PortraitPad from Spotlight. An iPad icon appears in the menu bar.
+3. The portrait display appears on the iPad. Hold the iPad upright.
+4. To stop, click the iPad icon in the menu bar and choose Quit PortraitPad.
 
-1. Sambungkan iPad lewat **Sidecar** (Control Center ▸ Screen Mirroring ▸ pilih iPad, mode Extended).
-2. Buka **PortraitPad** lewat Spotlight. Ikon iPad muncul di menu bar.
-3. Layar portrait langsung muncul di iPad. Pegang iPad dalam posisi tegak.
-4. Selesai: klik ikon iPad di menu bar ▸ **Quit PortraitPad**.
+## 4. Permissions
 
-## 4. Izin (pertama kali, dan setelah build ulang tanpa sertifikat lokal)
+macOS asks for these the first time, and again after a rebuild without the certificate from step 5.
+Both are in System Settings ▸ Privacy & Security:
 
-System Settings ▸ Privacy & Security:
+- Screen & System Audio Recording is required. Without it the iPad stays black.
+- Accessibility is needed for touch. Without it you still see the picture, but taps and scrolls do
+  nothing.
 
-- **Screen & System Audio Recording**: wajib, untuk menampilkan gambar.
-- **Accessibility**: untuk ketuk, scroll, dan swipe dari iPad. Tanpa izin ini gambar tetap tampil,
-  tapi sentuhan tidak berfungsi.
+After you allow them, quit PortraitPad and open it again.
 
-Setelah memberi izin, tutup lalu buka lagi PortraitPad.
+## 5. Optional: a local signing certificate
 
-## Cek kalau ada masalah
+`build.sh` signs the app with the identity `PortraitPad Local Signing` if it is in your login
+keychain. macOS ties permissions to the signature, and an ad-hoc signature changes with every
+build, so a fixed identity keeps your permissions across rebuilds. Create it once per Mac:
+
+```bash
+cat > /tmp/pp.cfg <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = PortraitPad Local Signing
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+EOF
+cd /tmp
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout pp.key -out pp.pem -days 3650 -config pp.cfg
+/usr/bin/openssl pkcs12 -export -inkey pp.key -in pp.pem -out pp.p12 -passout pass:pp -name "PortraitPad Local Signing"
+security import pp.p12 -k ~/Library/Keychains/login.keychain-db -P pp -T /usr/bin/codesign
+rm pp.key pp.p12 pp.cfg
+```
+
+The first time `codesign` uses this key, macOS asks for your login password. Choose Always Allow.
+
+## If something does not work
 
 ```bash
 tail -20 ~/Library/Logs/PortraitPad.log
 ```
 
-- `Accessibility not granted yet`: izin Accessibility belum diberikan.
-- Tidak ada baris `Sidecar found`: Sidecar belum tersambung.
-- `capture failed`: izin Screen Recording belum diberikan.
+- `Accessibility not granted yet` means the Accessibility permission is missing.
+- No `Sidecar found` line means Sidecar is not connected.
+- `capture failed` means the Screen Recording permission is missing.

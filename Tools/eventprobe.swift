@@ -8,21 +8,21 @@ import AppKit
 
 let passive = CommandLine.arguments.contains("--passive") || CommandLine.arguments.contains("--cursortest")   // non-activating, never key (like PortraitPad)
 let allSteps: [(text: String, secs: Double)] = [
-    ("1/6  Ketuk SEKALI dengan 1 jari.\nUlangi 3x, pelan-pelan.", 12),
-    ("2/6  Tempel 1 jari, lalu geser\nATAS-BAWAH beberapa kali.", 12),
-    ("3/6  Geser ATAS-BAWAH dengan 2 jari.", 12),
-    ("4/6  Tekan lama 1 jari (±1 detik).\nLakukan 2x.", 12),
-    ("5/6  Ketuk dengan 2 jari. 3x.", 10),
-    ("6/6  Apple Pencil: ketuk 3x, lalu goreskan.\n(Lewati kalau tidak ada pencil.)", 12),
+    ("1/6  Tap ONCE with 1 finger.\nDo it 3 times, slowly.", 12),
+    ("2/6  Put 1 finger down, then drag\nUP and DOWN a few times.", 12),
+    ("3/6  Drag UP and DOWN with 2 fingers.", 12),
+    ("4/6  Press and hold 1 finger (about 1 s).\nDo it twice.", 12),
+    ("5/6  Tap with 2 fingers, 3 times.", 10),
+    ("6/6  Apple Pencil: tap 3 times, then draw a line.\n(Skip this if you have no Pencil.)", 12),
 ]
 let cursorTest = CommandLine.arguments.contains("--cursortest")
 let cursorSteps: [(text: String, secs: Double)] = [
-    ("1/3  Ketuk 1 jari 3x.\n(pointer sengaja ditaruh di laptop)", 12),
-    ("2/3  Ketuk 1 jari 3x lagi.\n(pointer sekarang di iPad)", 12),
-    ("3/3  Tempel 1 jari, geser\nATAS-BAWAH pelan beberapa kali.", 15),
+    ("1/3  Tap with 1 finger, 3 times.\n(the pointer is on the Mac on purpose)", 12),
+    ("2/3  Tap with 1 finger, 3 more times.\n(the pointer is now on the iPad)", 12),
+    ("3/3  Put 1 finger down, drag\nUP and DOWN slowly a few times.", 15),
 ]
 let steps: [(text: String, secs: Double)] = cursorTest ? cursorSteps : passive
-    ? [("1/2  Ketuk SEKALI dengan 1 jari.\nUlangi 3x, pelan-pelan.", 12), ("2/2  Tempel 1 jari, lalu geser\nATAS-BAWAH beberapa kali.", 12)]
+    ? [("1/2  Tap ONCE with 1 finger.\nDo it 3 times, slowly.", 12), ("2/2  Put 1 finger down, then drag\nUP and DOWN a few times.", 12)]
     : allSteps
 
 let typeNames: [UInt: String] = [
@@ -78,12 +78,12 @@ class ProbeView: NSView {
         bounds.fill()
         let text: String
         if stepIndex < 0 {
-            text = "UJI GESTUR\n\nKetuk layar ini sekali untuk mulai."
+            text = "GESTURE TEST\n\nTap this screen once to start."
         } else if stepIndex < steps.count {
             let left = max(0, Int(steps[stepIndex].secs - Date().timeIntervalSince(stepStarted)))
             text = steps[stepIndex].text + "\n\nsisa \(left) detik"
         } else {
-            text = "Selesai. Terima kasih!"
+            text = "Done. Thank you!"
         }
         let style = NSMutableParagraphStyle()
         style.alignment = .center
