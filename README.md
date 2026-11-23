@@ -1,131 +1,122 @@
 # PortraitPad
 
-Membuat iPad yang tersambung lewat **Sidecar** tampil **portrait (tegak)** di Mac, lengkap dengan
-input sentuh. Sidecar bawaan Apple tidak bisa diputar; PortraitPad menggantikan BetterDisplay untuk
-satu tugas ini saja, tanpa aplikasi berbayar.
+PortraitPad lets you use an iPad connected with Sidecar as a portrait (upright) display for your Mac,
+and you can still tap and scroll on it with your finger.
 
-Diuji di macOS 27.0.1, MacBook Air M1, iPad Pro 12.9" (M1).
+macOS cannot rotate a Sidecar display. BetterDisplay can work around this, but the feature is paid.
+PortraitPad does this one job for free, in a single small menu bar app.
 
-## Versi
+Tested on macOS 27.0.1 and 27.2.1 with a MacBook Air (M1) and a 12.9-inch iPad Pro (M1).
 
-- **`main`**: portrait, ketuk = klik, scroll 1 jari, dan swipe 2 jari untuk pindah Space.
-- **Tag `v1-konservatif`**: versi yang lebih konservatif dan paling aman, **tanpa** swipe 2 jari
-  (tidak ada tombol Ctrl yang dikirim). Kalau swipe menimbulkan masalah, kembali ke versi ini:
+PortraitPad is an unofficial project and is not affiliated with Apple. It uses private macOS APIs,
+so a macOS update can break it.
+
+## What it does
+
+- Adds a portrait display called "PortraitPad" to your Mac and shows it on the iPad, rotated so it
+  reads correctly when you hold the iPad upright.
+- Starts by itself when Sidecar connects and stops when Sidecar disconnects.
+- Remembers where you put the portrait display in System Settings ▸ Displays ▸ Arrange.
+- Keeps the real Sidecar screen (hidden behind the picture) parked in the far corner of the iPad
+  screen, so your pointer does not get lost on it. If something moves it back, for example System
+  Settings when you close Arrange, PortraitPad parks it again.
+- Uses very little power: about 0.5 to 0.7% CPU and 15 to 30 MB of memory when the screen is still.
+
+## Touch gestures on the iPad
+
+| Gesture | Result |
+|---|---|
+| Tap with one finger | Left click at that spot |
+| Drag one finger (right away, or after holding) | Scroll that follows your finger, with momentum |
+| Swipe two fingers left or right, then lift | Switch Space or full-screen app on the iPad display (Ctrl+→ / Ctrl+←) |
+| Any other two-finger gesture, or three or more fingers | Ignored |
+
+Your trackpad and mouse work exactly as before.
+
+Scrolling does not move your pointer. macOS sends scroll events to the window under the pointer,
+and Electron apps such as Claude ignore scroll events sent to them directly. So when the pointer is
+somewhere else, PortraitPad borrows it: it hides the pointer, moves it under your finger, and puts it
+back when the scroll and its momentum end. If you touch the trackpad in the meantime, you get the
+pointer back at once and the scroll stops. A two-finger swipe borrows the pointer the same way for
+150 ms, because macOS switches the Space on the display that has the pointer.
+
+Sidecar delivers finger touches to AppKit gesture recognizers as `directTouch` events, not as mouse
+events. The comments in `InputView` (`Sources/main.swift`) explain how PortraitPad handles them.
+
+## Requirements
+
+- A Mac with macOS 14 or later.
+- An iPad that supports Sidecar.
+- Command Line Tools with Swift 6.x (`xcode-select --install`). You do not need Xcode.
+
+## Install
+
+```bash
+git clone https://github.com/ziaihsan/PortraitPad.git
+cd PortraitPad
+./build.sh
+cp -R build/PortraitPad.app ~/Applications/
+```
+
+Then open PortraitPad from Spotlight and connect your iPad with Sidecar.
+
+[SETUP.md](SETUP.md) has the full steps: permissions, a signing certificate so you do not have to
+grant permissions again after every build, and what to check when something does not work.
+
+PortraitPad needs two permissions, both in System Settings ▸ Privacy & Security:
+
+- Screen & System Audio Recording, to capture the portrait display.
+- Accessibility, to turn your taps, scrolls, and swipes into clicks and key presses.
+
+To start PortraitPad automatically when you log in, add `~/Applications/PortraitPad.app` in System
+Settings ▸ General ▸ Login Items. It does not do this by itself.
+
+## Versions
+
+- `main` has portrait display, tap to click, one-finger scrolling, and two-finger swipes to switch
+  Spaces.
+- Tag `v1-konservatif` is a more conservative version without the two-finger swipe, so it never
+  sends the Control key. If swipes cause problems, build that version instead:
 
   ```bash
-  git checkout v1-konservatif && ./build.sh   # lalu pasang ulang seperti di bawah
+  git checkout v1-konservatif && ./build.sh
   ```
 
-## Cara kerja
+## How it works
 
 ```
-layar virtual "PortraitPad" 984×1312 pt, HiDPI, 60 Hz   (CGVirtualDisplay, API privat)
-  → direkam dengan ScreenCaptureKit (frame IOSurface, hanya saat isi layar berubah)
-  → ditempel ke CALayer yang diputar +90° di jendela yang menutupi layar Sidecar
+virtual display "PortraitPad", 984×1312 pt, HiDPI, 60 Hz   (CGVirtualDisplay, private API)
+  → captured with ScreenCaptureKit (IOSurface frames, only when the content changes)
+  → shown on a CALayer rotated +90° in a window that covers the Sidecar screen
 ```
 
-Tidak ada salinan piksel lewat CPU. Saat diam sekitar 0,5–0,7% CPU dan ~15–30 MB RAM.
+Frames go straight from ScreenCaptureKit to Core Animation, with no pixel copies on the CPU.
 
-- Menyala/mati otomatis saat Sidecar tersambung/putus.
-- Posisi layar iPad terakhir (System Settings ▸ Displays ▸ Arrange) diingat dan dipakai lagi.
-- Layar Sidecar asli (tersembunyi di belakang stream) selalu diparkir otomatis di sudut luar layar
-  iPad, jauh dari Mac, supaya pointer tidak tersesat ke sana. Kalau ada yang memindahkannya
-  (misalnya System Settings saat Arrange ditutup), PortraitPad mengembalikannya.
-
-## Gestur sentuh di iPad
-
-| Gerakan | Hasil |
-|---|---|
-| Ketuk 1 jari | Klik kiri di titik itu |
-| 1 jari geser (langsung atau setelah ditahan) | Scroll mengikuti jari, dengan momentum |
-| 2 jari geser ke kiri / kanan, lalu angkat | Pindah Space / aplikasi full-screen di layar iPad (Ctrl+→ / Ctrl+←) |
-| Gerakan 2 jari lainnya, 3 jari atau lebih | Diabaikan |
-
-Gerakan trackpad dan mouse tidak pernah diubah. Scroll tidak memindah pointer: macOS mengirim
-scroll ke jendela di bawah pointer (dan aplikasi Electron seperti Claude mengabaikan scroll yang
-dikirim langsung), jadi kalau pointer tidak sedang di atas jendela yang disentuh, pointer
-"dipinjam" dalam keadaan tersembunyi lalu dikembalikan setelah scroll dan momentum selesai.
-Menggerakkan trackpad selama itu langsung mengembalikan pointer dan menghentikan scroll.
-Swipe 2 jari meminjam pointer dengan cara yang sama (150 ms), karena macOS memindah Space di layar
-tempat pointer berada.
-
-Sidecar mengirim sentuhan jari ke *gesture recognizer* AppKit (event `directTouch`), bukan sebagai
-event mouse. Lihat komentar di `InputView` (`Sources/main.swift`) untuk detailnya.
-
-## Build dan pasang
-
-Panduan langkah demi langkah dari nol (tanpa jalan otomatis saat login): [SETUP.md](SETUP.md).
-
-Butuh Command Line Tools (Swift 6.x), tanpa Xcode.
+## Debugging
 
 ```bash
-./build.sh                                   # → build/PortraitPad.app
-osascript -e 'quit app "PortraitPad"'
-rm -rf ~/Applications/PortraitPad.app && cp -R build/PortraitPad.app ~/Applications/
-open ~/Applications/PortraitPad.app
-```
-
-Supaya jalan otomatis saat login: System Settings ▸ General ▸ Login Items ▸ tambahkan
-`~/Applications/PortraitPad.app`.
-
-### Izin
-
-Sekali saja, di System Settings ▸ Privacy & Security:
-
-- **Screen & System Audio Recording**: untuk merekam layar virtual.
-- **Accessibility**: untuk meneruskan klik, scroll, dan Ctrl+arrow.
-
-### Sertifikat tanda tangan lokal
-
-`build.sh` menandatangani dengan identitas `PortraitPad Local Signing` dari keychain login. Dengan
-tanda tangan yang tetap, izin di atas tidak ter-reset setiap kompilasi ulang (tanda tangan ad-hoc
-berubah tiap build). Kalau identitasnya tidak ada, `build.sh` jatuh ke ad-hoc dan memberi peringatan.
-
-Membuat identitasnya (sekali per Mac):
-
-```bash
-cat > /tmp/pp.cfg <<'EOF'
-[req]
-distinguished_name = dn
-x509_extensions = ext
-prompt = no
-[dn]
-CN = PortraitPad Local Signing
-[ext]
-basicConstraints = critical,CA:false
-keyUsage = critical,digitalSignature
-extendedKeyUsage = critical,codeSigning
-EOF
-cd /tmp
-/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout pp.key -out pp.pem -days 3650 -config pp.cfg
-/usr/bin/openssl pkcs12 -export -inkey pp.key -in pp.pem -out pp.p12 -passout pass:pp -name "PortraitPad Local Signing"
-security import pp.p12 -k ~/Library/Keychains/login.keychain-db -P pp -T /usr/bin/codesign
-rm pp.key pp.p12 pp.cfg
-```
-
-Saat `codesign` pertama kali memakai kunci ini, macOS meminta password login. Pilih **Always Allow**.
-
-## Debug
-
-```bash
-defaults write local.z.PortraitPad debugInput -bool true    # catat tiap sentuhan
+defaults write local.z.PortraitPad debugInput -bool true    # log every touch
 tail -f ~/Library/Logs/PortraitPad.log
 ```
 
-Matikan lagi dengan `defaults delete local.z.PortraitPad debugInput`, lalu
-jalankan ulang aplikasinya.
+To turn it off, run `defaults delete local.z.PortraitPad debugInput` and restart the app.
 
-`Tools/eventprobe.swift` adalah alat terpisah yang dipakai untuk mencari tahu apa yang sebenarnya
-dikirim Sidecar untuk tiap gerakan jari. Instruksinya tampil tegak di iPad, dan semua event dicatat:
+`Tools/eventprobe.swift` is a separate tool for finding out what Sidecar actually sends for each
+finger gesture. It shows instructions upright on the iPad and logs every event:
 
 ```bash
 swiftc -O Tools/eventprobe.swift -o build/eventprobe
-build/eventprobe --cursortest > probe.log    # juga: --passive, --level=N
+build/eventprobe --cursortest > probe.log    # also: --passive, --level=N
 ```
 
-## Batasan
+## Limitations
 
-- Sidecar dikunci Apple di **60 Hz**. Layar ProMotion 120 Hz tidak bisa dipakai lewat jalur ini.
-- `CGVirtualDisplay` dan properti `SetsCursorInBackground` (menyembunyikan pointer dari latar belakang)
-  adalah API privat. Update macOS bisa mengubahnya (diverifikasi masih jalan di macOS 27).
-- Desktop Sidecar asli tetap ada di belakang stream. Jendela yang terseret ke sana tidak terlihat.
+- The portrait size is fixed at 984×1312 points, which matches the 3:4 screen of the 12.9-inch iPad
+  Pro. On an iPad with a different shape the picture is stretched a little. To change it, edit
+  `pointsW` and `pointsH` at the top of `Sources/main.swift`.
+- The rotation direction is fixed: the top of the picture is on the left edge of the iPad when it
+  is held in landscape.
+- Apple limits Sidecar to 60 Hz, so ProMotion (120 Hz) does not work this way.
+- `CGVirtualDisplay` and the `SetsCursorInBackground` property (used to hide the pointer while
+  PortraitPad borrows it) are private APIs. They still work on macOS 27.
+- The real Sidecar desktop still exists behind the picture. A window dragged onto it is hidden.
