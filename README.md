@@ -54,6 +54,8 @@ event mouse. Lihat komentar di `InputView` (`Sources/main.swift`) untuk detailny
 
 ## Build dan pasang
 
+Panduan langkah demi langkah dari nol (tanpa jalan otomatis saat login): [SETUP.md](SETUP.md).
+
 Butuh Command Line Tools (Swift 6.x), tanpa Xcode.
 
 ```bash
